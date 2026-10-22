@@ -380,14 +380,181 @@ def test_convert_skips_invalid_scores_and_continues(tmp_path, monkeypatch, capsy
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({"questions": {"rating": SPEC["questions"]["frustration"]}}), encoding="utf-8")
     src, out = tmp_path / "ratings.csv", tmp_path / "out.jsonl"
-    src.write_text("body,rating\nfirst,1.9\nsecond,Infinity\nthird,2.0\nfourth,medium\n", encoding="utf-8")
+    src.write_text("body,rating\nfirst,1.9\nsecond,Infinity\nthird,2.0\nfourth,medium\nnear,0.99999999999999999\n", encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(src), "--state", "body", "--score-offset", "1",
                                     "--map", "rating=medium:2.0", "--out", str(out)])
     assert convert_data.main() == 0
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert [r["state"] for r in rows] == ["third", "fourth"]
     assert all(r["questions"]["rating"]["label"] == 1 for r in rows)
+    assert "3 rows skipped" in capsys.readouterr().out
+
+
+RATING_SPEC = {"questions": {"rating": {"type": "score", "instructions": "Rate this synthetic example.", "criteria": ["low", "medium", "high"]}}}
+
+
+def test_convert_jsonl_skips_near_integer_score(tmp_path, monkeypatch, capsys):
+    spec, src, out = tmp_path / "workload.json", tmp_path / "ratings.jsonl", tmp_path / "converted.jsonl"
+    spec.write_text(json.dumps(RATING_SPEC), encoding="utf-8")
+    text = ('{"body":"valid integer","rating":1}\n'
+            '{"body":"ordinary fraction","rating":1.9}\n'
+            '{"body":"near-integer fraction","rating":0.99999999999999999}\n')
+    src.write_text(text, encoding="utf-8")
+    read = list(convert_data.rows_from(src))
+    assert isinstance(read[0]["rating"], int) and not isinstance(read[0]["rating"], bool)
+    assert isinstance(read[1]["rating"], convert_data.Decimal) and str(read[1]["rating"]) == "1.9"
+    assert str(read[2]["rating"]) == "0.99999999999999999"
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(src), "--state", "body", "--out", str(out)])
+    assert convert_data.main() == 0
+    written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [row["state"] for row in written] == ["valid integer"]
+    assert written[0]["questions"]["rating"]["label"] == 1 and type(written[0]["questions"]["rating"]["label"]) is int
     assert "2 rows skipped" in capsys.readouterr().out
+
+
+def test_convert_json_state_numbers_stay_plain(tmp_path, monkeypatch, capsys):
+    spec = tmp_path / "workload.json"
+    spec.write_text(json.dumps(RATING_SPEC), encoding="utf-8")
+    payload = ('[{"body":"one point zero","weight":0.25,"count":2,"nested":{"n":1.5,"sci":1e20},"rating":1.0,'
+               '"trail":1.00,"neg":-0.0,"big":9007199254740993},'
+               '{"body":"near-integer fraction","weight":0.1,"rating":0.99999999999999999}]')
+    columns = "body,weight,count,nested,trail,neg,big"
+    for name, text in (("ratings.json", payload), ("wrapped.json", '{"rows": ' + payload + "}"), ("data.json", '{"data": ' + payload + "}")):
+        src, out = tmp_path / name, tmp_path / f"{name}.out.jsonl"
+        src.write_text(text, encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(src), "--state", columns, "--out", str(out)])
+        assert convert_data.main() == 0
+        raw = out.read_text(encoding="utf-8")
+        written = [json.loads(line) for line in raw.splitlines()]
+        assert len(written) == 1 and written[0]["questions"]["rating"]["label"] == 1
+        state = written[0]["state"]
+        assert state["body"] == "one point zero"
+        assert state["weight"] == 0.25 and type(state["weight"]) is float
+        assert state["count"] == 2 and type(state["count"]) is int
+        assert state["nested"] == {"n": 1.5, "sci": 1e20}
+        assert state["big"] == 9007199254740993 and type(state["big"]) is int
+        # Same bytes json.loads would have written for these numbers, including exponent, trailing zeros and -0.0.
+        plain = json.loads(payload)[0]
+        for key in ("weight", "count", "nested", "trail", "neg", "big"):
+            assert json.dumps(state[key]) == json.dumps(plain[key])
+        assert "Decimal" not in raw
+        assert "1 rows skipped" in capsys.readouterr().out
+
+
+def test_convert_json_score_edges_and_other_labels_keep_float_spelling(tmp_path, monkeypatch, capsys):
+    """1e0 / 1.00 / -0.0 stay whole levels. NaN, Infinity and 1e9999999 are skipped.
+    A noul or choice label keeps the str(float) spelling, so 1e0 is not the integer 1 and 1.0e1 is not option "10".
+    """
+    spec = tmp_path / "workload.json"
+    questions = {"rating": RATING_SPEC["questions"]["rating"],
+                 "flag": {"type": "noul", "instructions": "Yes?", "criteria": {"true": "yes", "false": "no"}},
+                 "bucket": {"type": "choice", "instructions": "Which?", "criteria": {"10": "ten", "25": None, "billing": "money"}}}
+    spec.write_text(json.dumps({"questions": questions}), encoding="utf-8")
+    rows = "\n".join([
+        '{"body":"e0","rating":1e0,"flag":true,"bucket":"billing"}',
+        '{"body":"two","rating":2e0,"flag":false,"bucket":"10"}',
+        '{"body":"one","rating":1.0,"flag":true,"bucket":"billing"}',
+        '{"body":"zeros","rating":1.00,"flag":true,"bucket":"billing"}',
+        '{"body":"neg","rating":-0.0,"flag":false,"bucket":"billing"}',
+        '{"body":"negexp","rating":-0e0,"flag":false,"bucket":"billing"}',
+        '{"body":"near","rating":0.99999999999999999,"flag":true,"bucket":"billing"}',
+        '{"body":"fraction","rating":1.9,"flag":true,"bucket":"billing"}',
+        '{"body":"nan","rating":NaN,"flag":true,"bucket":"billing"}',
+        '{"body":"inf","rating":Infinity,"flag":true,"bucket":"billing"}',
+        '{"body":"ninf","rating":-Infinity,"flag":true,"bucket":"billing"}',
+        '{"body":"huge","rating":1e9999999,"flag":true,"bucket":"billing"}',
+        '{"body":"big","rating":1000000000000000000000000000001,"flag":true,"bucket":"billing"}',
+        '{"body":"noul exp","rating":1,"flag":1e0,"bucket":"billing"}',
+        '{"body":"noul zero","rating":1,"flag":0e0,"bucket":"billing"}',
+        '{"body":"noul float","rating":1,"flag":1.0,"bucket":"billing"}',
+        '{"body":"noul int","rating":0,"flag":1,"bucket":"10"}',
+        '{"body":"choice exp","rating":1,"flag":true,"bucket":1.0e1}',
+        '{"body":"choice 25","rating":1,"flag":false,"bucket":2.5e1}',
+        '{"body":"choice float","rating":1,"flag":true,"bucket":10.0}',
+        '{"body":"state","rating":0,"flag":false,"bucket":"billing","sci":1e20,"neg":-0.0,"nan":NaN,"inf":Infinity}',
+    ]) + "\n"
+    src, out = tmp_path / "rows.jsonl", tmp_path / "out.jsonl"
+    src.write_text(rows, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(src), "--state", "body,sci,neg,nan,inf", "--out", str(out)])
+    assert convert_data.main() == 0
+    written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    kept = [row["state"]["body"] for row in written]
+    assert kept == ["e0", "two", "one", "zeros", "neg", "negexp", "noul int", "state"]
+    labels = {row["state"]["body"]: row["questions"]["rating"]["label"] for row in written}
+    assert labels == {"e0": 1, "two": 2, "one": 1, "zeros": 1, "neg": 0, "negexp": 0, "noul int": 0, "state": 0}
+    assert all(type(row["questions"]["rating"]["label"]) is int for row in written)
+    noul_int = next(row for row in written if row["state"]["body"] == "noul int")
+    assert noul_int["questions"]["flag"]["label"] is True and noul_int["questions"]["bucket"]["label"] == "10"
+    state = next(row for row in written if row["state"]["body"] == "state")["state"]
+    plain = json.loads(rows.splitlines()[-1])
+    for key in ("sci", "neg", "nan", "inf"):
+        assert json.dumps(state[key]) == json.dumps(plain[key])
+    report = capsys.readouterr().out
+    assert "13 rows skipped" in report and "0.99999999999999999" in report and "1E+9999999" in report
+    spec.write_text(json.dumps(RATING_SPEC), encoding="utf-8")
+    mapped, mapped_out = tmp_path / "mapped.jsonl", tmp_path / "mapped.out.jsonl"
+    mapped.write_text('{"body":"a","rating":1.00}\n{"body":"b","rating":1e0}\n{"body":"c","rating":1.0}\n', encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(mapped), "--state", "body", "--map", "rating=1.0:2", "--out", str(mapped_out)])
+    assert convert_data.main() == 0
+    mapped_rows = [json.loads(line) for line in mapped_out.read_text(encoding="utf-8").splitlines()]
+    assert [row["state"] for row in mapped_rows] == ["a", "b", "c"]
+    assert [row["questions"]["rating"]["label"] for row in mapped_rows] == [2, 2, 2]
+    csv_src, csv_out = tmp_path / "ratings.csv", tmp_path / "csv.jsonl"
+    csv_src.write_text("body,rating\ne0,2e0\nneg,-0.0\nnear,0.99999999999999999\nhuge,1e9999999\ninf,Infinity\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(csv_src), "--state", "body", "--out", str(csv_out)])
+    assert convert_data.main() == 0
+    csv_rows = [json.loads(line) for line in csv_out.read_text(encoding="utf-8").splitlines()]
+    assert [row["state"] for row in csv_rows] == ["e0", "neg"]
+    assert [row["questions"]["rating"]["label"] for row in csv_rows] == [2, 0]
+
+
+def test_convert_jsonl_keeps_choice_and_noul(tmp_path, monkeypatch):
+    src, out = tmp_path / "rows.jsonl", tmp_path / "out.jsonl"
+    src.write_text('{"body":"charged twice","department":"billing","escalate":true,"frustration":0}\n', encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(SKILL / "assets/workload.example.json"), str(src), "--state", "body", "--out", str(out)])
+    assert convert_data.main() == 0
+    row = json.loads(out.read_text(encoding="utf-8"))
+    assert row["questions"]["department"]["label"] == "billing"
+    assert row["questions"]["escalate"]["label"] is True
+    assert row["questions"]["frustration"]["label"] == 0
+
+
+def test_parse_records_rejects_near_integer_score():
+    fraction = '{"records":[{"state":{"note":0.25},"labels":{"department":"billing","escalate":true,"frustration":0.99999999999999999}}]}'
+    item = generate_data.parse_records(fraction)[0]
+    record, why = generate_data.to_record(SPEC, item)
+    assert record is None and "score label" in why
+    kept = '{"records":[{"state":{"note":0.25},"labels":{"department":"billing","escalate":true,"frustration":1.0}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(kept)[0])
+    assert why is None and record["questions"]["frustration"]["label"] == 1
+    assert record["state"] == {"note": 0.25} and type(record["state"]["note"]) is float
+    assert "Decimal" not in json.dumps(record)
+    integer = '{"records":[{"state":"valid integer","labels":{"department":"billing","escalate":false,"frustration":1}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(integer)[0])
+    assert why is None and record["questions"]["frustration"]["label"] == 1 and record["questions"]["escalate"]["label"] is False
+    huge = '{"records":[{"state":"x","labels":{"department":"billing","escalate":true,"frustration":1e9999999}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(huge)[0])
+    assert record is None and "score label" in why and "Decimal" not in why and len(why) < 200
+    for token, label in (("1e0", 1), ("2e0", 2), ("1.00", 1), ("-0.0", 0), ("-0e0", 0)):
+        body = '{"records":[{"state":{"note":' + token + ',"big":9007199254740993},"labels":{"department":"billing","escalate":false,"frustration":' + token + '}}]}'
+        record, why = generate_data.to_record(SPEC, generate_data.parse_records(body)[0])
+        assert why is None and record["questions"]["frustration"]["label"] == label and type(record["questions"]["frustration"]["label"]) is int
+        assert json.dumps(record["state"]["note"]) == json.dumps(json.loads(token))
+        assert record["state"]["big"] == 9007199254740993 and type(record["state"]["big"]) is int
+    for token in ("1.9", "0.99999999999999999", "NaN", "Infinity", "-Infinity"):
+        body = '{"records":[{"state":"x","labels":{"department":"billing","escalate":true,"frustration":' + token + '}}]}'
+        record, why = generate_data.to_record(SPEC, generate_data.parse_records(body)[0])
+        assert record is None and "score label" in why and "Decimal" not in why
+    noul = '{"records":[{"state":"x","labels":{"department":"billing","escalate":1e0,"frustration":1}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(noul)[0])
+    assert record is None and "Decimal" not in why
+    choice = '{"records":[{"state":"x","labels":{"department":1.0e1,"escalate":true,"frustration":1}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(choice)[0])
+    assert record is None and "Decimal" not in why
+    text = '{"records":[{"state":"x","labels":{"department":"billing","escalate":true,"frustration":"Annoyed"}}]}'
+    record, why = generate_data.to_record(SPEC, generate_data.parse_records(text)[0])
+    assert record is None and "score label" in why
+    assert generate_data.coerce_label(SPEC["questions"]["frustration"], 2.0) == 2
 
 
 def test_extract_finds_typescript_and_python_questions(tmp_path):

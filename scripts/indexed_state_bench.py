@@ -23,18 +23,60 @@ from kev.suite import write_json
 from scripts.serving_bench import request
 
 
+def mixed_throughput(model, tok, ck):
+    """ABBA comparison of the server scheduler on the original seeded mixed workload."""
+    import random
+    from concurrent.futures import ThreadPoolExecutor
+    from kev.data import materialize
+    from kev.serve import Server
+    from kev.suite import load_split
+
+    records = random.Random(0).choices([materialize(r) for r in load_split('evals/v7/decision-v7', 'development')], k=256)
+
+    def run(clients):
+        def one(record):
+            start = time.perf_counter(); server.probs(record)
+            return (time.perf_counter() - start) * 1000
+        with ThreadPoolExecutor(clients) as pool:
+            start = time.perf_counter()
+            latencies = sorted(pool.map(one, records))
+            wall = time.perf_counter() - start
+        return {'requests_per_s': len(records) / wall, 'p50_ms': statistics.median(latencies),
+                'p99_ms': latencies[int(0.99 * (len(latencies) - 1))]}
+
+    phases = []
+    for indexed in (False, True, True, False):
+        model.graphs = None
+        gc.collect(); empty_cache('cuda')
+        model.lm.indexed_delta_states = indexed
+        model.graphs = CudaGraphs(model.lm, model.pad_id)
+        server = Server(ck, tok, model, 'cuda', release_date='-')
+        first = {n: run(n) for n in (32, 64)}
+        server.wait_idle()
+        result = {'indexed': indexed, 'first': first, 'steady': {n: run(n) for n in (32, 64)}, 'graphs': model.graphs.stats()}
+        phases.append(result)
+        server.close()
+        print(result, flush=True)
+    return phases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', required=True)
     ap.add_argument('--run', default='jaredpalmer/kev-4b@6cfce5c2fa4b4bd64026336ab649c5ca78857d52')
     ap.add_argument('--reps', type=int, default=15)
     ap.add_argument('--indexed-first', action='store_true', help='reverse the measurement order to check order effects')
+    ap.add_argument('--mixed-throughput', action='store_true', help='investigate scheduler throughput with an ABBA comparison')
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
     ck = Checkpoint(a.run)
     tok, model = ck.load('cuda', LoadOptions(dtype=torch.bfloat16, fused=True, cuda_graphs=True))
     report = {'run': a.run, 'environment': kernel_environment(model, 'cuda'), 'cuda': torch.version.cuda,
               'sources': source_hashes(), 'indexed_first': a.indexed_first, 'cases': {}}
+    if a.mixed_throughput:
+        report['mixed_throughput'] = mixed_throughput(model, tok, ck)
+        write_json(Path(a.out) / 'report.json', report)
+        return
     # Multiple identical requests share a bank entry; ticket numbers make distinct documents.
     cases = [(1, 1, False, 'warm'), (16, 1, False, 'warm'), (3, 3, False, 'warm'),
              (16, 16, False, 'warm'), (16, 16, True, 'warm'), (16, 16, False, 'cold'), (16, 16, False, 'mixed')]
